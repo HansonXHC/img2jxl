@@ -1,0 +1,168 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-tools
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/mingw64
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/img2jxl_selftest.exe
+
+      - name: Deploy Qt runtime
+        run: |
+          mkdir -p pkg/img2jxl-v${{ github.ref_name }}
+          cp build/img2jxl.exe build/img2jxl-gui.exe pkg/img2jxl-v${{ github.ref_name }}/
+          WDEP=$(command -v windeployqt || command -v windeployqt6)
+          "$WDEP" --release --no-translations \
+            --no-system-d3d-compiler --no-opengl-sw \
+            "pkg/img2jxl-v${{ github.ref_name }}/img2jxl-gui.exe"
+          rm -rf pkg/img2jxl-v${{ github.ref_name }}/tls \
+                 pkg/img2jxl-v${{ github.ref_name }}/networkinformation \
+                 pkg/img2jxl-v${{ github.ref_name }}/generic \
+                 pkg/img2jxl-v${{ github.ref_name }}/Qt6Network.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: img2jxl-${{ github.ref_name }}-windows-x64
+          path: pkg/
+
+  # ------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ qt6-base-dev libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/img2jxl_selftest
+
+      - name: Package (CLI + GUI with bundled Qt libs)
+        run: |
+          D=img2jxl-${{ github.ref_name }}-linux-x64
+          mkdir -p $D/lib $D/plugins/platforms $D/plugins/imageformats
+          cp build/img2jxl $D/
+          cp build/img2jxl-gui $D/
+          # bundle the Qt shared libraries the GUI links against
+          for lib in $(ldd build/img2jxl-gui | grep -oE '/[^ ]*libQt6[^ ]*\.so[^ ]*'); do
+            cp "$lib" $D/lib/
+          done
+          cp /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqxcb.so $D/plugins/platforms/ 2>/dev/null || true
+          for p in /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats/*.so; do
+            [ -e "$p" ] && cp "$p" $D/plugins/imageformats/
+          done
+          cat > $D/img2jxl-gui.sh << 'EOS'
+          #!/bin/sh
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
+          export QT_PLUGIN_PATH="$DIR/plugins"
+          exec "$DIR/img2jxl-gui" "$@"
+          EOS
+          chmod +x $D/img2jxl-gui.sh $D/img2jxl $D/img2jxl-gui
+          tar -czf $D.tar.gz $D
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: img2jxl-${{ github.ref_name }}-linux-x64
+          path: img2jxl-${{ github.ref_name }}-linux-x64.tar.gz
+
+  # ------------------------------------------------------------------
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          brew install cmake ninja qt
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ./build/img2jxl_selftest
+
+      - name: Package (CLI + GUI app bundle)
+        run: |
+          D=img2jxl-${{ github.ref_name }}-macos
+          mkdir -p $D
+          cp build/img2jxl $D/
+          # the GUI is built as an .app bundle on macOS; deploy Qt into it
+          ls build/*.app && macdeployqt build/*.app -no-strip
+          cp -R build/*.app $D/
+          tar -czf $D.tar.gz $D
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: img2jxl-${{ github.ref_name }}-macos
+          path: img2jxl-${{ github.ref_name }}-macos.tar.gz
+
+  # ------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Re-zip windows package
+        run: |
+          cd dist
+          d=$(find . -maxdepth 1 -type d -name '*windows*')
+          (cd "$d" && zip -r ../$(basename $d).zip .)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz

@@ -1,0 +1,15 @@
+# Build directories. Root-anchored on purpose: thirdparty/tiff/build is part of
+# the vendored libtiff source tree and must stay tracked.
+/build/
+/build-*/
+_deps/
+
+# Test output
+/testout/
+
+# Local IDE / OS junk
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
