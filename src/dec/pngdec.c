@@ -29,6 +29,58 @@ static void mem_read_fn(png_structp png, png_bytep out, png_size_t count)
     r->pos += count;
 }
 
+/* Collect the ancillary chunks we can carry into the .jxl output. */
+static int png_read_metadata(png_structp png, png_infop info, img_image_t *img)
+{
+    /* physical resolution: pHYs is pixels per meter */
+    png_uint_32 xppu = 0, yppu = 0;
+    int unit = 0;
+    if (png_get_pHYs(png, info, &xppu, &yppu, &unit) && unit == PNG_RESOLUTION_METER &&
+        xppu > 0 && yppu > 0) {
+        img->meta.res_unit = 3;                 /* centimeters */
+        img->meta.xres = (double)xppu / 100.0;
+        img->meta.yres = (double)yppu / 100.0;
+    }
+
+    /* ICC profile */
+    png_charp icc_name = NULL;
+    int icc_comp = 0;
+    png_bytep icc = NULL;
+    png_uint_32 icc_len = 0;
+    if (png_get_iCCP(png, info, &icc_name, &icc_comp, &icc, &icc_len) && icc_len > 0)
+        img_meta_set_icc(&img->meta, icc, icc_len);
+
+    /* Exif (eXIf chunk holds a bare TIFF blob, same as our meta.exif) */
+    png_bytep exif = NULL;
+    png_uint_32 exif_len = 0;
+    if (png_get_eXIf_1(png, info, &exif_len, &exif) && exif_len > 0)
+        img_meta_set_exif(&img->meta, exif, exif_len);
+
+    /* tEXt / zTXt / iTXt */
+    png_textp texts = NULL;
+    int ntexts = 0;
+    if (png_get_text(png, info, &texts, &ntexts) > 0) {
+        for (int i = 0; i < ntexts; i++) {
+            const png_text *t = &texts[i];
+            if (!t->key || !t->key[0])
+                continue;
+            const char *val = t->text;
+            const char *lang = NULL;
+            if (t->compression == PNG_ITXT_COMPRESSION_NONE ||
+                t->compression == PNG_ITXT_COMPRESSION_zTXt) {
+                lang = (t->lang && t->lang[0]) ? t->lang : NULL;
+                if (!val || !val[0])
+                    continue;
+            } else if (!val || !val[0]) {
+                continue;
+            }
+            if (img_meta_add_text(&img->meta, t->key, lang, val) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 int png_decode_mem(const uint8_t *data, size_t size, img_image_t *img,
                    char *err, size_t errlen)
 {
@@ -129,6 +181,11 @@ int png_decode_mem(const uint8_t *data, size_t size, img_image_t *img,
             img->has_gray_trns = 1;
             img->gray_trns_value = trans_color->gray;
         }
+    }
+
+    if (png_read_metadata(png, info, img) != 0) {
+        png_destroy_read_struct(&png, &info, NULL);
+        return fail(err, errlen, "out of memory");
     }
 
     img->data = (uint8_t *)malloc(img->rowstride * h);

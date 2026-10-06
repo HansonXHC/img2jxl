@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(img2jxl VERSION 1.0.0 LANGUAGES C CXX)
+project(img2jxl VERSION 1.1.0 LANGUAGES C CXX)
 
 option(IMG2JXL_GUI "Build the Qt GUI" ON)
 option(IMG2JXL_TESTS "Build tests" ON)

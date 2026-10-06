@@ -177,6 +177,7 @@ int main(int argc, char **argv)
     opts.effort = 10;
     opts.modular = 1;
     opts.auto_optimize = 0;
+    opts.keep_metadata = 1;
     int keep_time = 1;
     int nthreads = img_num_cpus();
     const char *out_spec = NULL;
@@ -205,6 +206,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "img2jxl: -j must be 1-256\n");
                 return 2;
             }
+        } else if (!strcmp(a, "--no-metadata")) {
+            opts.keep_metadata = 0;
         } else if (!strcmp(a, "--auto")) {
             opts.auto_optimize = 1;
         } else if (!strcmp(a, "--keep-time")) {

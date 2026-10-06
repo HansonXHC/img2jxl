@@ -321,6 +321,222 @@ static int gen_png16_gray_trns(const char *path, int w, int h, unsigned trns_val
     return 0;
 }
 
+/* Build a minimal big-endian TIFF/Exif blob (Make + resolution tags). */
+static void put_be16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void put_be32(uint8_t *p, unsigned v)
+{ p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+static size_t make_exif_blob(uint8_t *out, size_t cap)
+{
+    enum { BLOB = 84 };
+    if (cap < BLOB)
+        return 0;
+    memset(out, 0, BLOB);
+    memcpy(out, "MM", 2);
+    put_be16(out + 2, 42);          /* big-endian TIFF magic */
+    put_be32(out + 4, 8);           /* IFD0 offset */
+    put_be16(out + 8, 4);           /* entry count */
+    uint8_t *e = out + 10;          /* entries: tag(2) type(2) count(4) value(4) */
+    put_be16(e +  0, 0x010F); put_be16(e +  2, 2); put_be32(e +  4, 5); put_be32(e +  8, 62); /* Make */
+    put_be16(e + 12, 0x011A); put_be16(e + 14, 5); put_be32(e + 16, 1); put_be32(e + 20, 68); /* XRes */
+    put_be16(e + 24, 0x011B); put_be16(e + 26, 5); put_be32(e + 28, 1); put_be32(e + 32, 76); /* YRes */
+    put_be16(e + 36, 0x0128); put_be16(e + 38, 3); put_be32(e + 40, 1); put_be16(e + 44, 2);  /* unit=inch */
+    /* next IFD offset stays 0 */
+    memcpy(out + 62, "ACME", 4);    /* Make value */
+    put_be32(out + 68, 72); put_be32(out + 72, 1);   /* XResolution = 72/1 */
+    put_be32(out + 76, 72); put_be32(out + 80, 1);   /* YResolution = 72/1 */
+    return BLOB;
+}
+
+/* Insert an APP1 Exif segment right after the SOI marker of a JPEG file. */
+static int jpeg_inject_exif(const char *path, const uint8_t *tiff, size_t tlen)
+{
+    FILE *f = img_fopen_read(path);
+    if (!f)
+        return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    uint8_t *d = (uint8_t *)malloc((size_t)n);
+    int ok = d && fread(d, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    if (!ok || n < 2 || d[0] != 0xFF || d[1] != 0xD8) {
+        free(d);
+        return -1;
+    }
+    size_t seg = 2 + 6 + tlen;                 /* length field + "Exif\0\0" + TIFF */
+    FILE *o = img_fopen_write(path);
+    int rc = -1;
+    if (o) {
+        uint8_t m[4] = {0xFF, 0xE1, (uint8_t)(seg >> 8), (uint8_t)seg};
+        rc = (fwrite(d, 1, 2, o) == 2 &&
+              fwrite(m, 1, 4, o) == 4 &&
+              fwrite("Exif\0\0", 1, 6, o) == 6 &&
+              fwrite(tiff, 1, tlen, o) == tlen &&
+              fwrite(d + 2, 1, (size_t)n - 2, o) == (size_t)n - 2) ? 0 : -1;
+        fclose(o);
+    }
+    free(d);
+    return rc;
+}
+
+/* Write a small JXL whose color encoding is linear sRGB: unlike plain sRGB
+ * this makes libjxl store an ICC profile, which we can read back and reuse
+ * as a genuine, valid ICC payload for the metadata tests. */
+static int gen_linear_jxl(const char *path)
+{
+    enum { LW = 4, LH = 2 };
+    uint8_t px[LW * LH * 3];
+    for (int i = 0; i < LW * LH * 3; i++)
+        px[i] = (uint8_t)(i * 7);
+    JxlEncoder *enc = JxlEncoderCreate(NULL);
+    JxlEncoderFrameSettings *fs = JxlEncoderFrameSettingsCreate(enc, NULL);
+    JxlEncoderFrameSettingsSetOption(fs, JXL_ENC_FRAME_SETTING_EFFORT, 3);
+    JxlEncoderSetFrameLossless(fs, JXL_TRUE);
+    JxlBasicInfo bi;
+    JxlEncoderInitBasicInfo(&bi);
+    bi.xsize = LW;
+    bi.ysize = LH;
+    bi.bits_per_sample = 8;
+    bi.num_color_channels = 3;
+    bi.uses_original_profile = JXL_TRUE;
+    int ok = JxlEncoderSetBasicInfo(enc, &bi) == JXL_ENC_SUCCESS;
+    JxlColorEncoding ce;
+    JxlColorEncodingSetToLinearSRGB(&ce, JXL_FALSE);
+    ok = ok && JxlEncoderSetColorEncoding(enc, &ce) == JXL_ENC_SUCCESS;
+    JxlPixelFormat pf;
+    memset(&pf, 0, sizeof(pf));
+    pf.num_channels = 3;
+    pf.data_type = JXL_TYPE_UINT8;
+    pf.endianness = JXL_NATIVE_ENDIAN;
+    ok = ok && JxlEncoderAddImageFrame(fs, &pf, px, sizeof(px)) == JXL_ENC_SUCCESS;
+    JxlEncoderCloseInput(enc);
+    uint8_t *out = (uint8_t *)malloc(1 << 16);
+    size_t cap = 1 << 16;
+    uint8_t *np = out;
+    while (ok) {
+        JxlEncoderStatus st = JxlEncoderProcessOutput(enc, &np, &cap);
+        if (st == JXL_ENC_SUCCESS)
+            break;
+        if (st != JXL_ENC_NEED_MORE_OUTPUT) { ok = 0; break; }
+    }
+    if (ok) {
+        FILE *f = img_fopen_write(path);
+        ok = f && fwrite(out, 1, (size_t)(np - out), f) == (size_t)(np - out);
+        if (f)
+            fclose(f);
+    }
+    free(out);
+    JxlEncoderDestroy(enc);
+    return ok ? 0 : -1;
+}
+
+/* A PNG carrying pHYs (72 dpi), an ICC profile and two text chunks. */
+static int gen_png_meta(const char *path, const uint8_t *icc, size_t icc_len)
+{
+    FILE *f = img_fopen_write(path);
+    if (!f)
+        return -1;
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    if (!png || !info) {
+        if (png) png_destroy_write_struct(&png, NULL);
+        fclose(f);
+        return -1;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(f);
+        return -1;
+    }
+    png_init_io(png, f);
+    png_set_IHDR(png, info, 8, 6, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_set_pHYs(png, info, 2835, 2835, PNG_RESOLUTION_METER);  /* 2835 px/m ~ 72 dpi */
+    if (icc && icc_len)
+        png_set_iCCP(png, info, "selftest", PNG_COMPRESSION_TYPE_BASE,
+                     (png_const_bytep)icc, (png_uint_32)icc_len);
+    png_text txt[2];
+    memset(txt, 0, sizeof(txt));
+    txt[0].compression = PNG_TEXT_COMPRESSION_NONE;
+    txt[0].key = (png_charp)"Title";
+    txt[0].text = (png_charp)"Metadata test";
+    txt[1].compression = PNG_TEXT_COMPRESSION_NONE;
+    txt[1].key = (png_charp)"Software";
+    txt[1].text = (png_charp)"img2jxl selftest";
+    png_set_text(png, info, txt, 2);
+    png_write_info(png, info);
+    uint8_t row[8 * 3];
+    for (int y = 0; y < 6; y++) {
+        for (int x = 0; x < 8; x++) {
+            row[x * 3 + 0] = (uint8_t)(x * 30);
+            row[x * 3 + 1] = (uint8_t)(y * 40);
+            row[x * 3 + 2] = 128;
+        }
+        png_write_row(png, row);
+    }
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(f);
+    return 0;
+}
+
+/* Read a whole file; returns a malloc'ed buffer (caller frees) or NULL. */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    FILE *f = img_fopen_read(path);
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    uint8_t *b = (uint8_t *)malloc(n > 0 ? (size_t)n : 1);
+    int ok = b && fread(b, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    if (!ok) {
+        free(b);
+        return NULL;
+    }
+    *len = (size_t)n;
+    return b;
+}
+
+/* Parse a big-endian Exif IFD0 for the physical resolution. */
+static int exif_resolution(const uint8_t *e, size_t len, int *unit, double *xres)
+{
+    if (len < 14 || e[0] != 'M' || e[1] != 'M')
+        return -1;
+    size_t ifd = ((size_t)e[4] << 24) | ((size_t)e[5] << 16) |
+                 ((size_t)e[6] << 8) | e[7];
+    if (ifd + 2 > len)
+        return -1;
+    int n = (e[ifd] << 8) | e[ifd + 1];
+    *unit = 0;
+    *xres = 0.0;
+    for (int i = 0; i < n; i++) {
+        size_t p = ifd + 2 + (size_t)i * 12;
+        if (p + 12 > len)
+            break;
+        unsigned tag = ((unsigned)e[p] << 8) | e[p + 1];
+        unsigned type = ((unsigned)e[p + 2] << 8) | e[p + 3];
+        if (tag == 0x011A && type == 5) {
+            size_t o = ((size_t)e[p + 8] << 24) | ((size_t)e[p + 9] << 16) |
+                       ((size_t)e[p + 10] << 8) | e[p + 11];
+            if (o + 8 <= len) {
+                unsigned num = ((unsigned)e[o] << 24) | ((unsigned)e[o + 1] << 16) |
+                               ((unsigned)e[o + 2] << 8) | e[o + 3];
+                unsigned den = ((unsigned)e[o + 4] << 24) | ((unsigned)e[o + 5] << 16) |
+                               ((unsigned)e[o + 6] << 8) | e[o + 7];
+                if (den)
+                    *xres = (double)num / (double)den;
+            }
+        } else if (tag == 0x0128 && type == 3) {
+            *unit = ((int)e[p + 8] << 8) | e[p + 9];
+        }
+    }
+    return 0;
+}
+
 /* --- verification helpers --- */
 
 /* decode a .jxl file with the same decoder the CLI uses for .jxl inputs */
@@ -597,6 +813,7 @@ int main(int argc, char **argv)
     opts.effort = 10;
     opts.modular = 1;
     opts.auto_optimize = 0;
+    opts.keep_metadata = 1;
 
     int W = 33, H = 17;     /* odd sizes to exercise padding paths */
     char err[256];
@@ -757,6 +974,276 @@ pgm_done:;
             img_free(&img);
         }
         free(jbuf);
+    }
+
+    /* --- JPEG Exif: metadata must be stored in a readable Exif box --- */
+    printf("JPEG Exif metadata box:\n");
+    {
+        uint8_t tiff[84];
+        size_t tlen = make_exif_blob(tiff, sizeof(tiff));
+        CHECK(tlen == 84, "build Exif blob");
+        CHECK(gen_jpeg("testout/exif.jpg", 17, 13) == 0, "generate jpeg for the Exif test");
+        CHECK(jpeg_inject_exif("testout/exif.jpg", tiff, tlen) == 0, "inject Exif APP1");
+
+        uint8_t *jb = NULL;
+        size_t jl = 0;
+        FILE *f = img_fopen_read("testout/exif.jpg");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            jl = (size_t)ftell(f);
+            rewind(f);
+            jb = (uint8_t *)malloc(jl);
+            if (fread(jb, 1, jl, f) != jl) { free(jb); jb = NULL; }
+            fclose(f);
+        }
+        jxl_opts_t eo = opts;
+        eo.effort = 3;
+        CHECK(jb && jxl_transcode_jpeg(jb, jl, &eo, "testout/exif.jxl", err, sizeof(err)) == 0,
+              "transcode jpeg carrying Exif");
+
+        /* walk the JXL container boxes */
+        uint8_t *jx = NULL;
+        size_t jxlen = 0;
+        FILE *xf = img_fopen_read("testout/exif.jxl");
+        if (xf) {
+            fseek(xf, 0, SEEK_END);
+            jxlen = (size_t)ftell(xf);
+            rewind(xf);
+            jx = (uint8_t *)malloc(jxlen);
+            if (fread(jx, 1, jxlen, xf) != jxlen) { free(jx); jx = NULL; }
+            fclose(xf);
+        }
+        int exif_ok = 0, brob_seen = 0, jbrd_seen = 0;
+        if (jx) {
+            size_t off = 0;
+            while (off + 8 <= jxlen) {
+                uint32_t bsz = ((uint32_t)jx[off] << 24) | ((uint32_t)jx[off+1] << 16) |
+                               ((uint32_t)jx[off+2] << 8) | jx[off+3];
+                size_t hdr = 8;
+                if (bsz == 1) {
+                    if (off + 16 > jxlen) break;
+                    bsz = 0;
+                    for (int k = 0; k < 8; k++) bsz = (bsz << 8) | jx[off + 8 + k];
+                    hdr = 16;
+                } else if (bsz == 0) {
+                    bsz = (uint32_t)(jxlen - off);
+                }
+                const uint8_t *type = jx + off + 4;
+                if (!memcmp(type, "Exif", 4)) {
+                    size_t clen = bsz - hdr;
+                    exif_ok = (clen == tlen + 4) &&
+                              !memcmp(jx + off + hdr, "\0\0\0\0", 4) &&
+                              !memcmp(jx + off + hdr + 4, tiff, tlen);
+                }
+                if (!memcmp(type, "brob", 4)) brob_seen = 1;
+                if (!memcmp(type, "jbrd", 4)) jbrd_seen = 1;
+                if (bsz < hdr) break;
+                off += bsz;
+            }
+        }
+        CHECK(exif_ok, "plain Exif box present with the exact injected payload");
+        CHECK(!brob_seen, "metadata is not brotli-wrapped in a brob box");
+        CHECK(jbrd_seen, "jbrd reconstruction data still present");
+
+        /* and the JPEG must still come back byte-for-byte */
+        if (jb) {
+            FILE *rf = img_fopen_read("testout/exif.jxl");
+            uint8_t *rec = NULL;
+            size_t reclen = 0;
+            int rrc = rf ? jxl_reconstruct_jpeg(rf, &rec, &reclen, err, sizeof(err)) : -1;
+            if (rf) fclose(rf);
+            CHECK(rrc == 0 && reclen == jl && compare_buf(rec, jb, jl) < 0,
+                  "Exif-bearing JPEG reconstructs byte-for-byte");
+            free(rec);
+        }
+        free(jb);
+        free(jx);
+    }
+
+    /* --- metadata carrying: DPI / ICC / Exif / text --- */
+    printf("metadata carrying:\n");
+    {
+        /* a non-sRGB JXL gives us a genuine ICC profile to work with */
+        CHECK(gen_linear_jxl("testout/linear.jxl") == 0, "generate linear-sRGB jxl");
+        img_image_t lin;
+        int chl = read_jxl_img("testout/linear.jxl", &lin);
+        CHECK(chl == 3 && lin.meta.icc_len > 0, "non-sRGB jxl exposes its ICC profile");
+        uint8_t icc_copy[4096];
+        size_t icc_len = 0;
+        if (chl == 3 && lin.meta.icc_len && lin.meta.icc_len <= sizeof(icc_copy)) {
+            icc_len = lin.meta.icc_len;
+            memcpy(icc_copy, lin.meta.icc, icc_len);
+        }
+        if (chl == 3)
+            img_free(&lin);
+
+        /* PNG with pHYs + ICC + text chunks */
+        CHECK(icc_len > 0 && gen_png_meta("testout/meta.png", icc_copy, icc_len) == 0,
+              "generate png with pHYs/ICC/text");
+        size_t pblen = 0;
+        uint8_t *pb = slurp("testout/meta.png", &pblen);
+        img_image_t src;
+        int okm = pb && png_decode_mem(pb, pblen, &src, err, sizeof(err)) == 0;
+        free(pb);
+        CHECK(okm, "decode png with metadata");
+        if (okm) {
+            CHECK(src.meta.xres > 28.0 && src.meta.xres < 28.5 && src.meta.res_unit == 3,
+                  "pHYs read as 28.35 px/cm");
+            CHECK(src.meta.icc_len == icc_len, "PNG iCCP read");
+            CHECK(src.meta.ntexts == 2 &&
+                  !strcmp(src.meta.texts[0].key, "Title") &&
+                  !strcmp(src.meta.texts[0].value, "Metadata test") &&
+                  !strcmp(src.meta.texts[1].key, "Software"),
+                  "PNG text chunks read");
+
+            jxl_opts_t mo = opts;
+            mo.effort = 3;
+            CHECK(jxl_write_file(&src, &mo, "testout/meta.jxl", err, sizeof(err)) == 0,
+                  "encode png with metadata");
+            img_free(&src);
+
+            img_image_t back;
+            int chb = read_jxl_img("testout/meta.jxl", &back);
+            CHECK(chb == 3, "jxl carrying metadata decodes");
+            if (chb == 3) {
+                CHECK(back.meta.icc_len == icc_len &&
+                      !memcmp(back.meta.icc, icc_copy, icc_len),
+                      "ICC profile round-trips byte-exactly");
+                CHECK(back.meta.ntexts == 2 &&
+                      !strcmp(back.meta.texts[0].key, "Title") &&
+                      !strcmp(back.meta.texts[0].value, "Metadata test") &&
+                      !strcmp(back.meta.texts[1].key, "Software") &&
+                      !strcmp(back.meta.texts[1].value, "img2jxl selftest"),
+                      "text chunks round-trip");
+                /* the resolution travelled in a synthesized Exif box */
+                int unit = 0;
+                double xres = 0.0;
+                CHECK(exif_resolution(back.meta.exif, back.meta.exif_len,
+                                      &unit, &xres) == 0 &&
+                      unit == 3 && xres > 28.3 && xres < 28.4,
+                      "Exif resolution box carries 72 dpi (28.35 px/cm)");
+                img_free(&back);
+            }
+
+            /* keep_metadata = 0 must leave a bare file */
+            size_t pblen2 = 0;
+            uint8_t *pb2 = slurp("testout/meta.png", &pblen2);
+            img_image_t src2;
+            if (pb2 && png_decode_mem(pb2, pblen2, &src2, err, sizeof(err)) == 0) {
+                jxl_opts_t nm = opts;
+                nm.effort = 3;
+                nm.keep_metadata = 0;
+                CHECK(jxl_write_file(&src2, &nm, "testout/nometa.jxl", err, sizeof(err)) == 0,
+                      "encode with metadata disabled");
+                img_free(&src2);
+                img_image_t b2;
+                if (read_jxl_img("testout/nometa.jxl", &b2) == 3) {
+                    CHECK(b2.meta.exif_len == 0 && b2.meta.icc_len == 0 &&
+                          b2.meta.ntexts == 0,
+                          "disabled metadata leaves a bare file");
+                    img_free(&b2);
+                }
+            }
+            free(pb2);
+        }
+    }
+
+    /* --- metadata from TIFF (resolution + description) and GIF (comment) --- */
+    printf("metadata from TIFF and GIF:\n");
+    {
+        TIFF *tf = TIFFOpen("testout/meta.tiff", "w");
+        CHECK(tf != NULL, "open tiff for metadata test");
+        if (tf) {
+            TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, 4);
+            TIFFSetField(tf, TIFFTAG_IMAGELENGTH, 3);
+            TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 8);
+            TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 3);
+            TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
+            TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+            TIFFSetField(tf, TIFFTAG_XRESOLUTION, 300.0f);
+            TIFFSetField(tf, TIFFTAG_YRESOLUTION, 300.0f);
+            TIFFSetField(tf, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
+            TIFFSetField(tf, TIFFTAG_IMAGEDESCRIPTION, "TIFF metadata probe");
+            uint8_t row[4 * 3];
+            int wok = 1;
+            for (int y = 0; y < 3 && wok; y++) {
+                for (int x = 0; x < 4; x++) {
+                    row[x * 3 + 0] = (uint8_t)(x * 50);
+                    row[x * 3 + 1] = (uint8_t)(y * 70);
+                    row[x * 3 + 2] = 200;
+                }
+                wok = TIFFWriteScanline(tf, row, (uint32_t)y, 0) >= 0;
+            }
+            CHECK(wok, "write tiff with metadata");
+            TIFFClose(tf);
+        }
+        FILE *tfh = img_fopen_read("testout/meta.tiff");
+        img_image_t ti;
+        int okti = tfh && tiff_decode(tfh, &ti, err, sizeof(err)) == 0;
+        if (tfh) fclose(tfh);
+        CHECK(okti, "decode tiff with metadata");
+        if (okti) {
+            CHECK(ti.meta.res_unit == 2 && ti.meta.xres > 299.0 && ti.meta.xres < 301.0,
+                  "TIFF resolution read (300 dpi)");
+            CHECK(ti.meta.ntexts == 1 && !strcmp(ti.meta.texts[0].key, "Description") &&
+                  !strcmp(ti.meta.texts[0].value, "TIFF metadata probe"),
+                  "TIFF description read");
+            jxl_opts_t to = opts;
+            to.effort = 3;
+            CHECK(jxl_write_file(&ti, &to, "testout/metatiff.jxl", err, sizeof(err)) == 0,
+                  "encode tiff with metadata");
+            img_free(&ti);
+            img_image_t tb;
+            if (read_jxl_img("testout/metatiff.jxl", &tb) == 3) {
+                int unit = 0;
+                double xres = 0.0;
+                CHECK(exif_resolution(tb.meta.exif, tb.meta.exif_len, &unit, &xres) == 0 &&
+                      unit == 2 && xres > 299.0 && xres < 301.0,
+                      "300 dpi survives into the jxl Exif box");
+                img_free(&tb);
+            }
+        }
+    }
+    {
+        int ge = 0;
+        GifFileType *gf = EGifOpenFileName("testout/meta.gif", 0, &ge);
+        CHECK(gf != NULL, "open gif for metadata test");
+        if (gf) {
+            GifColorType pal[2] = {{0, 0, 0}, {255, 255, 255}};
+            ColorMapObject *cm = GifMakeMapObject(2, pal);
+            int okg = EGifPutScreenDesc(gf, 4, 3, 2, 0, cm) == GIF_OK;
+            okg &= EGifPutComment(gf, "GIF metadata probe") == GIF_OK;
+            okg &= EGifPutImageDesc(gf, 0, 0, 4, 3, 0, NULL) == GIF_OK;
+            uint8_t raster[12];
+            for (int i = 0; i < 12; i++)
+                raster[i] = (uint8_t)(i & 1);
+            okg &= EGifPutLine(gf, raster, 12) == GIF_OK;
+            okg &= EGifCloseFile(gf, &ge) == GIF_OK;
+            GifFreeMapObject(cm);
+            CHECK(okg, "write gif with a comment");
+        }
+        FILE *gifh = img_fopen_read("testout/meta.gif");
+        img_image_t gi;
+        int okgi = gifh && gif_decode(gifh, &gi, err, sizeof(err)) == 0;
+        if (gifh) fclose(gifh);
+        CHECK(okgi, "decode gif with a comment");
+        if (okgi) {
+            CHECK(gi.meta.ntexts == 1 && !strcmp(gi.meta.texts[0].key, "Comment") &&
+                  !strcmp(gi.meta.texts[0].value, "GIF metadata probe"),
+                  "GIF comment read as a text pair");
+            jxl_opts_t go = opts;
+            go.effort = 3;
+            CHECK(jxl_write_file(&gi, &go, "testout/metagif.jxl", err, sizeof(err)) == 0,
+                  "encode gif with metadata");
+            img_free(&gi);
+            img_image_t gb;
+            if (read_jxl_img("testout/metagif.jxl", &gb) == 3) {
+                CHECK(gb.meta.ntexts == 1 &&
+                      !strcmp(gb.meta.texts[0].value, "GIF metadata probe"),
+                      "GIF comment survives into the jxl text box");
+                img_free(&gb);
+            }
+        }
     }
 
     /* --- timestamp copy --- */

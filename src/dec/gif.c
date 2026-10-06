@@ -15,6 +15,28 @@ static int gif_read_fn(GifFileType *gif, GifByteType *buf, int len)
     return (int)fread(buf, 1, (size_t)len, (FILE *)gif->UserData);
 }
 
+/* GIF comment extensions become text pairs we can carry into the .jxl. */
+static void gif_read_comments(GifFileType *gif, img_meta_t *meta)
+{
+    if (!gif || !gif->SavedImages)
+        return;
+    for (int i = 0; i < gif->ImageCount; i++) {
+        const SavedImage *im = &gif->SavedImages[i];
+        for (int e = 0; e < im->ExtensionBlockCount; e++) {
+            const ExtensionBlock *b = &im->ExtensionBlocks[e];
+            if (b->Function != COMMENT_EXT_FUNC_CODE || !b->Bytes || b->ByteCount <= 0)
+                continue;
+            char *v = (char *)malloc((size_t)b->ByteCount + 1);
+            if (!v)
+                return;
+            memcpy(v, b->Bytes, (size_t)b->ByteCount);
+            v[b->ByteCount] = 0;
+            img_meta_add_text(meta, "Comment", NULL, v);
+            free(v);
+        }
+    }
+}
+
 int gif_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
 {
     int gif_err = 0;
@@ -48,6 +70,7 @@ int gif_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
     int transparent = gcb.TransparentColor;   /* -1 when absent */
 
     memset(img, 0, sizeof(*img));
+    gif_read_comments(gif, &img->meta);
     img->width = w;
     img->height = h;
     img->color = IMG_PALETTE;
@@ -178,6 +201,7 @@ int gif_decode_anim(FILE *f, img_animation_t *anim, char *err, size_t errlen)
     anim->height = H;
     anim->nframes = gif->ImageCount;
     anim->loops = gif_parse_loops(gif);
+    gif_read_comments(gif, &anim->meta);
     anim->frames = (img_image_t *)calloc((size_t)anim->nframes, sizeof(img_image_t));
     anim->x = (int *)calloc((size_t)anim->nframes, sizeof(int));
     anim->y = (int *)calloc((size_t)anim->nframes, sizeof(int));

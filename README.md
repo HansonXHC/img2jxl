@@ -15,7 +15,9 @@ libtiff — every dependency is bundled, so the project builds offline.
   every output back and compares it pixel-by-pixel against the source.
 - **JPEG without generation loss**: JPEG inputs are transcoded at the
   DCT-coefficient level (`JxlEncoderAddJPEGFrame`) with reconstruction data
-  embedded, so the original file can be restored byte-for-byte.
+  embedded, so the original file can be restored byte-for-byte. Camera metadata
+  (Exif, XMP, JUMBF) is written into **uncompressed** `Exif` / `xml ` / `jumb`
+  boxes so ordinary viewers can read it.
 - **Animated GIF → JXL animation**: delays, loop count, frame offsets,
   transparency and disposal semantics are carried over.
 - **Bit-depth matching**: color model, bit depth and alpha follow the source —
@@ -24,6 +26,9 @@ libtiff — every dependency is bundled, so the project builds offline.
 - **Automatic coding-tool selection**: Modular mode is on by default, so
   libjxl picks the predictors, palette transform, RCT and squeeze passes per
   image. Nothing to tune beyond the effort level.
+- **Metadata preserved**: ICC, Exif, XMP, text chunks and the physical resolution
+  (DPI) come across from the source — a converted photo still carries its camera
+  data, a converted PNG keeps its DPI. `--no-metadata` strips it.
 - **Batch-friendly**: folders are scanned recursively, files convert in
   parallel on all cores, and output timestamps match the input's.
 
@@ -44,7 +49,7 @@ expanded during encoding — losslessly, since the values are preserved exactly.
 | PNM P1/P2/P4/P5 | GRAY; PBM stays 1-bit; maxval > 255 → 16-bit |
 | PNM P3/P6 | RGB; maxval > 255 → 16-bit |
 | ICO | largest entry, keeping its color type and depth; AND-mask transparency applied |
-| JPEG | **bitstream transcode** (reconstruction data stored, EXIF kept); pixel re-encode as fallback |
+| JPEG | **bitstream transcode** (reconstruction data stored, EXIF kept as a readable, uncompressed `Exif` box); pixel re-encode as fallback |
 | PNG | re-encoded natively: 1/2/4/8/16-bit, palette and tRNS all preserved |
 | GIF | multi-frame → **JXL animation**; single frame → 8-bit RGB(A) with tRNS |
 | QOI | 8-bit RGB / RGBA |
@@ -74,6 +79,30 @@ pure-grayscale RGB to GRAY before encoding.
   of every displayed frame is exact; only pixels that a restore-to-previous
   would reveal *outside* later frames' rectangles can differ from a player
   implementing the mode natively.
+
+### Metadata
+
+Source metadata is carried over by default, so a `.jxl` keeps what the original had:
+
+- **ICC profile** — becomes the colour encoding of the codestream (byte-exact round-trip), instead of the plain sRGB tag.
+- **Exif** — written as an **uncompressed** `Exif` box. (JPEG inputs go through libjxl's bitstream transcode, which writes that box itself.)
+- **XMP** — written as an `xml ` box.
+- **Text** — PNG `tEXt`/`iTXt`/`zTXt` chunks, TIFF description/software/artist/copyright/date and GIF comments are written into a private `jxtx` box; JPEG XL has no standard text-chunk home, and img2jxl reads this box back on re-encode.
+- **Physical resolution (DPI)** — PNG `pHYs`, TIFF resolution and JFIF density are stored in an Exif resolution blob (`XResolution` / `YResolution` / `ResolutionUnit`), which is what viewers read for DPI and print size.
+
+`--no-metadata` on the CLI, or unchecking *Keep metadata* in the GUI, writes a bare `.jxl` instead.
+
+What each input can contribute:
+
+| Source | Carried into the .jxl |
+|---|---|
+| JPEG | Exif, XMP and JUMBF, written by the bitstream transcode (cannot be stripped in this mode — libjxl needs them for byte-exact JPEG reconstruction) |
+| PNG | `eXIf`, `iCCP`, `pHYs`, `tEXt`/`iTXt`/`zTXt` |
+| TIFF | resolution, ICC, XMP, description / software / artist / copyright / date |
+| WebP | `EXIF`, `ICCP` and `XMP ` chunks |
+| GIF | comment extensions |
+| JXL | boxes and ICC are read back and re-emitted, so re-encoding a `.jxl` is metadata-preserving |
+| BMP, TGA, PNM, QOI | nothing to carry (ICO inherits whatever its embedded PNG holds) |
 
 ## Building
 
@@ -128,7 +157,7 @@ about if you touch the build:
 
 ```
 img2jxl [-o out.jxl|outdir] [-e 1-10] [--no-modular] [-j N] [--auto]
-        [--no-keep-time] file-or-folder...
+        [--no-metadata] [--no-keep-time] file-or-folder...
 ```
 
 | Option | Meaning | Default |
@@ -138,6 +167,7 @@ img2jxl [-o out.jxl|outdir] [-e 1-10] [--no-modular] [-j N] [--auto]
 | `--no-modular` | let the encoder choose VarDCT/Modular per frame | Modular enforced |
 | `-j N` | parallel worker threads | logical CPU count |
 | `--auto` | optimization mode (drop useless alpha, detect grayscale) | off |
+| `--no-metadata` | do not carry source EXIF/ICC/DPI/text into the .jxl | metadata is kept |
 | `--no-keep-time` | don't copy timestamps from the input | timestamps kept |
 
 Behaviour worth remembering:
@@ -165,6 +195,7 @@ libraries must be on `PATH`):
   (folders are scanned recursively, duplicates are skipped).
 - Effort slider 1–10 (default 10), **Modular mode** checkbox (default on), and
   a thread count.
+- **Keep metadata** (default on) carries ICC/EXIF/DPI/text; uncheck for a bare file.
 - **Match source bit depth strictly** (default on) — unchecking enables the
   `--auto` optimizations. **Keep timestamps** is on by default.
 - **Overwrite originals** (default off). Unchecked, a job whose output would
@@ -204,7 +235,9 @@ and gray+alpha depth handling, and 12-bit JXL depth preservation.
   than the palette-indexed original.
 - **JPEG sources** keep their DCT coefficients; libjxl stores the information
   needed to rebuild the original file, so a `img2jxl photo.jpg` is a
-  re-compression rather than a re-encode.
+  re-compression rather than a re-encode. The Exif/XMP/JUMBF boxes are left
+  uncompressed on purpose: libjxl's default brotli-wraps them into `brob`
+  boxes, which most viewers don't decompress, making the metadata look lost.
 - **No GPU path** — converting many images in parallel already saturates the
   CPU, and a GPU entropy coder would not pay off on single files.
 
@@ -218,6 +251,15 @@ and gray+alpha depth handling, and 12-bit JXL depth preservation.
   output. Values are preserved exactly, but the declared depth becomes 8.
 - Associated (premultiplied) alpha in TIFF is carried as-is, not
   un-premultiplied.
+- On the JPEG bitstream-transcode path the metadata boxes cannot be stripped
+  (`--no-metadata` still leaves them): libjxl requires Exif and XMP to stay for
+  byte-exact JPEG reconstruction.
+- A TIFF's Exif IFD is not serialized into the Exif box; the resolution, ICC,
+  XMP and descriptive tags are carried.
+- Metadata inside brotli-wrapped `brob` boxes written by other tools is skipped
+  when re-encoding a `.jxl` (img2jxl itself always writes plain boxes).
+- Text goes into a private `jxtx` box, which standard viewers ignore — the data
+  is preserved for re-encoding, not displayed.
 - Windows paths go through the ANSI code page; Linux and macOS use UTF-8.
 - Windows x64 is tested locally. The Linux and macOS jobs in
   `.github/workflows/build.yml` build and pass the self-test in CI, but haven't

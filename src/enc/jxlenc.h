@@ -17,6 +17,9 @@ typedef struct {
                          * predictor/transform selection is built into it) */
     int auto_optimize;  /* drop useless alpha / gray detection (applied by
                          * the caller on decoded pixels) */
+    int keep_metadata;  /* carry source metadata into the .jxl (default 1):
+                         * ICC profile, Exif, XMP and text chunks, plus the
+                         * physical resolution when the source only has that */
 } jxl_opts_t;
 
 /* Encode *img as a .jxl file, preserving its color model and bit depth

@@ -62,6 +62,7 @@ private:
     QCheckBox *modularBox_;
     QSpinBox *threadsBox_;
     QCheckBox *strictDepthBox_;
+    QCheckBox *keepMetaBox_;
     QCheckBox *keepTimeBox_;
     QCheckBox *overwriteBox_;
     DropPathEdit *outDirEdit_;
@@ -87,8 +88,8 @@ class ConvertTask : public QRunnable
 {
 public:
     ConvertTask(MainWindow *win, QString in, QString out,
-                int effort, bool modular, bool autoOpt, bool keepTime,
-                bool replaceOriginal);
+                int effort, bool modular, bool autoOpt, bool keepMeta,
+                bool keepTime, bool replaceOriginal);
     void run() override;
 
 private:
@@ -96,7 +97,7 @@ private:
     QString in_, out_;
     int effort_;
     bool modular_;
-    bool autoOpt_, keepTime_, replace_;
+    bool autoOpt_, keepMeta_, keepTime_, replace_;
 };
 
 #endif

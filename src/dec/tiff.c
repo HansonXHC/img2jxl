@@ -100,6 +100,47 @@ static int layout_from_tags(uint16_t photometric, uint16_t spp,
     return 0;
 }
 
+/* Collect the tags we can carry into the .jxl output: physical resolution
+ * (which becomes an Exif resolution blob when the source has no Exif of its
+ * own), the ICC profile, XMP, and the descriptive text tags. */
+static void tiff_read_metadata(TIFF *tif, img_image_t *img)
+{
+    float xres = 0.0f, yres = 0.0f;
+    uint16_t unit = 0;
+    if (TIFFGetField(tif, TIFFTAG_XRESOLUTION, &xres) &&
+        TIFFGetField(tif, TIFFTAG_YRESOLUTION, &yres) &&
+        xres > 0.0f && yres > 0.0f) {
+        TIFFGetFieldDefaulted(tif, TIFFTAG_RESOLUTIONUNIT, &unit);
+        /* libtiff and Exif agree on the codes: 1 none, 2 inch, 3 cm */
+        if (unit == RESUNIT_INCH || unit == RESUNIT_CENTIMETER) {
+            img->meta.res_unit = (int)unit;
+            img->meta.xres = (double)xres;
+            img->meta.yres = (double)yres;
+        }
+    }
+
+    uint32_t count = 0;
+    void *data = NULL;
+    if (TIFFGetField(tif, TIFFTAG_ICCPROFILE, &count, &data) && count > 0)
+        img_meta_set_icc(&img->meta, (const uint8_t *)data, count);
+    count = 0; data = NULL;
+    if (TIFFGetField(tif, TIFFTAG_XMLPACKET, &count, &data) && count > 0)
+        img_meta_set_xmp(&img->meta, (const uint8_t *)data, count);
+
+    static const struct { uint32_t tag; const char *key; } text_tags[] = {
+        { TIFFTAG_IMAGEDESCRIPTION, "Description" },
+        { TIFFTAG_SOFTWARE,         "Software" },
+        { TIFFTAG_ARTIST,           "Artist" },
+        { TIFFTAG_COPYRIGHT,        "Copyright" },
+        { TIFFTAG_DATETIME,         "DateTime" },
+    };
+    for (size_t i = 0; i < sizeof(text_tags) / sizeof(text_tags[0]); i++) {
+        char *v = NULL;
+        if (TIFFGetField(tif, text_tags[i].tag, &v) && v && v[0])
+            img_meta_add_text(&img->meta, text_tags[i].key, NULL, v);
+    }
+}
+
 int tiff_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
 {
     TIFF *tif = TIFFClientOpen("memory", "r", (thandle_t)f,
@@ -180,6 +221,7 @@ int tiff_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
            : (img->color == IMG_RGB) ? 3
            : (img->color == IMG_RGBA) ? 4
            : 1;
+    tiff_read_metadata(tif, img);
     img->rowstride = img_rowstride(img->width, img->bit_depth, ch);
     img->data = (uint8_t *)calloc((size_t)img->height, img->rowstride);
     if (!img->data) {

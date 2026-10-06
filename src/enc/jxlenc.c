@@ -13,6 +13,10 @@ static int fail(char *err, size_t errlen, const char *msg)
     return -1;
 }
 
+/* defined in the ancillary-metadata section below */
+static int add_metadata(JxlEncoder *enc, const img_meta_t *m, int keep,
+                        int *used_icc, char *err, size_t errlen);
+
 /* ------------------------------------------------------------------ */
 /* growing output buffer drained via JxlEncoderProcessOutput           */
 /* ------------------------------------------------------------------ */
@@ -80,14 +84,14 @@ static int set_options(JxlEncoderFrameSettings *fs, const jxl_opts_t *opts)
     return 0;
 }
 
-/* Basic info + color encoding for a pixel buffer with the given channel
- * count (1=gray, 2=gray+alpha, 3=rgb, 4=rgba).  `storage` is the container
- * depth of the buffer (8 or 16) and `nominal` the declared sample depth;
- * they differ for 10/12-bit sources, whose samples are passed unscaled
- * (see JXL_BIT_DEPTH_FROM_CODESTREAM). */
-static int setup_basic_color(JxlEncoder *enc, int w, int h, int channels,
-                             int storage, int nominal, int animation,
-                             uint32_t num_loops)
+/* Basic info for a pixel buffer with the given channel count (1=gray,
+ * 2=gray+alpha, 3=rgb, 4=rgba).  `storage` is the container depth of the
+ * buffer (8 or 16) and `nominal` the declared sample depth; they differ for
+ * 10/12-bit sources, whose samples are passed unscaled (see
+ * JXL_BIT_DEPTH_FROM_CODESTREAM). */
+static int set_basic_info(JxlEncoder *enc, int w, int h, int channels,
+                          int storage, int nominal, int animation,
+                          uint32_t num_loops)
 {
     JxlBasicInfo bi;
     JxlEncoderInitBasicInfo(&bi);
@@ -112,11 +116,6 @@ static int setup_basic_color(JxlEncoder *enc, int w, int h, int channels,
         return -1;
     (void)storage;
 
-    JxlColorEncoding ce;
-    JxlColorEncodingSetToSRGB(&ce, bi.num_color_channels == 1 ? JXL_TRUE : JXL_FALSE);
-    if (JxlEncoderSetColorEncoding(enc, &ce) != JXL_ENC_SUCCESS)
-        return -1;
-
     if (has_alpha) {
         JxlExtraChannelInfo eci;
         JxlEncoderInitExtraChannelInfo(JXL_CHANNEL_ALPHA, &eci);
@@ -125,6 +124,168 @@ static int setup_basic_color(JxlEncoder *enc, int w, int h, int channels,
         if (JxlEncoderSetExtraChannelInfo(enc, 0, &eci) != JXL_ENC_SUCCESS)
             return -1;
     }
+    return 0;
+}
+
+/* Plain sRGB color encoding, used when there is no ICC profile to carry. */
+static int set_srgb(JxlEncoder *enc, int channels)
+{
+    JxlColorEncoding ce;
+    JxlColorEncodingSetToSRGB(&ce, (channels == 1 || channels == 2) ? JXL_TRUE : JXL_FALSE);
+    return JxlEncoderSetColorEncoding(enc, &ce) == JXL_ENC_SUCCESS ? 0 : -1;
+}
+
+/* Set up metadata + color encoding: the ICC profile (when present) replaces
+ * the sRGB color encoding, and everything else becomes container boxes. */
+static int setup_metadata_and_color(JxlEncoder *enc, const img_meta_t *m,
+                                    const jxl_opts_t *opts, int channels,
+                                    char *err, size_t errlen)
+{
+    int used_icc = 0;
+    if (add_metadata(enc, m, opts->keep_metadata, &used_icc, err, errlen) != 0)
+        return -1;
+    if (!used_icc && set_srgb(enc, channels) != 0)
+        return -1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* ancillary metadata                                                  */
+/* ------------------------------------------------------------------ */
+
+static void put_be16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void put_be32(uint8_t *p, unsigned v)
+{
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+/* A minimal big-endian Exif blob carrying just the physical resolution.
+ * Used when the source states a DPI (PNG pHYs, TIFF resolution, JFIF
+ * density) but has no Exif of its own to carry it. */
+static uint8_t *build_res_exif(double xres, double yres, int unit, size_t *outlen)
+{
+    enum { BLOB = 8 + 2 + 3 * 12 + 4 + 8 + 8 };   /* values start at 50 */
+    uint8_t *b = (uint8_t *)calloc(1, BLOB);
+    if (!b)
+        return NULL;
+    memcpy(b, "MM", 2);
+    put_be16(b + 2, 42);
+    put_be32(b + 4, 8);                 /* IFD0 offset */
+    put_be16(b + 8, 3);                 /* three entries */
+    uint8_t *e = b + 10;
+    put_be16(e +  0, 0x011A); put_be16(e +  2, 5); put_be32(e +  4, 1); put_be32(e +  8, 50);
+    put_be16(e + 12, 0x011B); put_be16(e + 14, 5); put_be32(e + 16, 1); put_be32(e + 20, 58);
+    put_be16(e + 24, 0x0128); put_be16(e + 26, 3); put_be32(e + 28, 1); put_be16(e + 32, (unsigned)unit);
+    /* next IFD offset stays 0 */
+    put_be32(b + 50, (unsigned)(xres * 100.0 + 0.5)); put_be32(b + 54, 100);
+    put_be32(b + 58, (unsigned)(yres * 100.0 + 0.5)); put_be32(b + 62, 100);
+    *outlen = BLOB;
+    return b;
+}
+
+/* Serialize text pairs into the payload of the private "jxtx" box:
+ * repeated { u32 keylen, key, u32 langlen, lang, u32 vallen, value }. */
+static uint8_t *build_text_box(const img_meta_t *m, size_t *outlen)
+{
+    size_t need = 0;
+    for (int i = 0; i < m->ntexts; i++)
+        need += 12 + strlen(m->texts[i].key) +
+                (m->texts[i].lang ? strlen(m->texts[i].lang) : 0) +
+                strlen(m->texts[i].value);
+    uint8_t *buf = (uint8_t *)malloc(need ? need : 1);
+    if (!buf)
+        return NULL;
+    uint8_t *p = buf;
+    for (int i = 0; i < m->ntexts; i++) {
+        const img_text_t *t = &m->texts[i];
+        size_t kl = strlen(t->key), ll = t->lang ? strlen(t->lang) : 0;
+        size_t vl = strlen(t->value);
+        put_be32(p, (unsigned)kl); p += 4;
+        memcpy(p, t->key, kl); p += kl;
+        put_be32(p, (unsigned)ll); p += 4;
+        if (ll) { memcpy(p, t->lang, ll); p += ll; }
+        put_be32(p, (unsigned)vl); p += 4;
+        memcpy(p, t->value, vl); p += vl;
+    }
+    *outlen = (size_t)(p - buf);
+    return buf;
+}
+
+/* Write ICC / Exif / XMP / text into the container.  Returns 0 on success;
+ * *used_icc is set when the ICC profile was accepted (the caller then skips
+ * the plain sRGB color encoding). */
+static int add_metadata(JxlEncoder *enc, const img_meta_t *m, int keep,
+                        int *used_icc, char *err, size_t errlen)
+{
+    *used_icc = 0;
+    if (!keep || img_meta_empty(m))
+        return 0;
+
+    if (m->icc && m->icc_len &&
+        JxlEncoderSetICCProfile(enc, m->icc, m->icc_len) == JXL_ENC_SUCCESS)
+        *used_icc = 1;
+
+    /* Exif: from the source, else synthesized from its resolution */
+    uint8_t *exif = NULL, *exif_owned = NULL;
+    size_t exif_len = 0;
+    if (m->exif && m->exif_len) {
+        exif = m->exif;
+        exif_len = m->exif_len;
+    } else if (m->xres > 0 && m->yres > 0) {
+        exif_owned = build_res_exif(m->xres, m->yres,
+                                    m->res_unit ? m->res_unit : 2, &exif_len);
+        exif = exif_owned;
+    }
+
+    uint8_t *texts = NULL;
+    size_t texts_len = 0;
+    if (m->ntexts > 0)
+        texts = build_text_box(m, &texts_len);
+
+    if (exif_len || (m->xmp && m->xmp_len) || texts_len)
+        JxlEncoderUseBoxes(enc);
+
+    if (exif_len) {
+        /* the Exif box content starts with a 4-byte offset to the TIFF header */
+        uint8_t *blob = (uint8_t *)calloc(1, exif_len + 4);
+        if (!blob) {
+            free(exif_owned);
+            free(texts);
+            return fail(err, errlen, "jxl: out of memory");
+        }
+        memcpy(blob + 4, exif, exif_len);
+        JxlEncoderStatus st = JxlEncoderAddBox(enc, "Exif", blob, exif_len + 4,
+                                               JXL_FALSE);
+        free(blob);
+        if (st != JXL_ENC_SUCCESS) {
+            free(exif_owned);
+            free(texts);
+            return fail(err, errlen, "jxl: cannot add Exif box");
+        }
+    }
+    if (m->xmp && m->xmp_len) {
+        if (JxlEncoderAddBox(enc, "xml ", m->xmp, m->xmp_len, JXL_FALSE)
+            != JXL_ENC_SUCCESS) {
+            free(exif_owned);
+            free(texts);
+            return fail(err, errlen, "jxl: cannot add XMP box");
+        }
+    }
+    if (texts_len) {
+        JxlEncoderStatus st = JxlEncoderAddBox(enc, "jxtx", texts, texts_len,
+                                               JXL_FALSE);
+        if (st != JXL_ENC_SUCCESS) {
+            free(exif_owned);
+            free(texts);
+            return fail(err, errlen, "jxl: cannot add text box");
+        }
+    }
+    if (exif_len || (m->xmp && m->xmp_len) || texts_len)
+        JxlEncoderCloseBoxes(enc);
+
+    free(exif_owned);
+    free(texts);
     return 0;
 }
 
@@ -313,11 +474,14 @@ int jxl_write_file(const img_image_t *img, const jxl_opts_t *opts,
         goto done;
     }
     int nominal_bits = img_nominal_depth(img);
-    if (setup_basic_color(enc, img->width, img->height, channels,
-                          sample_bits, nominal_bits, 0, 0) != 0) {
+    if (set_basic_info(enc, img->width, img->height, channels,
+                       sample_bits, nominal_bits, 0, 0) != 0) {
         fail(err, errlen, "jxl: cannot set basic info");
         goto done;
     }
+    if (setup_metadata_and_color(enc, &img->meta, opts, channels,
+                                 err, errlen) != 0)
+        goto done;
 
     JxlPixelFormat pf;
     memset(&pf, 0, sizeof(pf));
@@ -436,10 +600,12 @@ int jxl_write_anim(const img_animation_t *anim, const jxl_opts_t *opts,
         goto done;
     }
     uint32_t num_loops = anim->loops < 0 ? 1u : (uint32_t)anim->loops;
-    if (setup_basic_color(enc, anim->width, anim->height, 4, 8, 8, 1, num_loops) != 0) {
+    if (set_basic_info(enc, anim->width, anim->height, 4, 8, 8, 1, num_loops) != 0) {
         fail(err, errlen, "jxl: cannot set basic info");
         goto done;
     }
+    if (setup_metadata_and_color(enc, &anim->meta, opts, 4, err, errlen) != 0)
+        goto done;
 
     for (int i = 0; i < anim->nframes; i++) {
         if (add_anim_frame(fs, &anim->frames[i], anim->x[i], anim->y[i],
@@ -483,6 +649,15 @@ int jxl_transcode_jpeg(const uint8_t *jpeg, size_t size, const jxl_opts_t *opts,
 
     if (set_options(fs, opts) != 0) {
         fail(err, errlen, "jxl: cannot set frame options");
+        goto done;
+    }
+    /* Keep the JPEG-derived metadata boxes (Exif/XMP/JUMBF) uncompressed.
+     * libjxl defaults to brotli-compressing them into "brob" boxes, which
+     * most viewers do not decompress — the camera metadata then looks lost
+     * even though it is present in the file. */
+    if (JxlEncoderFrameSettingsSetOption(fs, JXL_ENC_FRAME_SETTING_JPEG_COMPRESS_BOXES, 0)
+        != JXL_ENC_SUCCESS) {
+        fail(err, errlen, "jxl: cannot disable metadata box compression");
         goto done;
     }
     if (JxlEncoderStoreJPEGMetadata(enc, JXL_TRUE) != JXL_ENC_SUCCESS) {

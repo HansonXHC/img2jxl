@@ -30,7 +30,96 @@ void img_free(img_image_t *img)
     if (img) {
         free(img->data);
         img->data = NULL;
+        img_meta_free(&img->meta);
     }
+}
+
+/* ---------------- ancillary metadata ---------------- */
+
+void img_meta_free(img_meta_t *m)
+{
+    if (!m)
+        return;
+    free(m->exif);
+    free(m->xmp);
+    free(m->icc);
+    for (int i = 0; i < m->ntexts; i++) {
+        free(m->texts[i].key);
+        free(m->texts[i].lang);
+        free(m->texts[i].value);
+    }
+    free(m->texts);
+    memset(m, 0, sizeof(*m));
+}
+
+static int set_blob(uint8_t **dst, size_t *dstlen, const uint8_t *d, size_t n)
+{
+    if (!d || n == 0)
+        return 0;
+    uint8_t *copy = (uint8_t *)malloc(n);
+    if (!copy)
+        return -1;
+    memcpy(copy, d, n);
+    free(*dst);
+    *dst = copy;
+    *dstlen = n;
+    return 0;
+}
+
+int img_meta_set_exif(img_meta_t *m, const uint8_t *d, size_t n)
+{
+    return set_blob(&m->exif, &m->exif_len, d, n);
+}
+
+int img_meta_set_xmp(img_meta_t *m, const uint8_t *d, size_t n)
+{
+    return set_blob(&m->xmp, &m->xmp_len, d, n);
+}
+
+int img_meta_set_icc(img_meta_t *m, const uint8_t *d, size_t n)
+{
+    return set_blob(&m->icc, &m->icc_len, d, n);
+}
+
+static char *dup_str(const char *s)
+{
+    if (!s)
+        return NULL;
+    size_t n = strlen(s) + 1;
+    char *c = (char *)malloc(n);
+    if (c)
+        memcpy(c, s, n);
+    return c;
+}
+
+int img_meta_add_text(img_meta_t *m, const char *key, const char *lang,
+                      const char *value)
+{
+    if (!key || !value || !value[0])
+        return 0;                       /* nothing worth keeping */
+    img_text_t *grown = (img_text_t *)realloc(
+        m->texts, (size_t)(m->ntexts + 1) * sizeof(img_text_t));
+    if (!grown)
+        return -1;
+    m->texts = grown;
+    img_text_t *t = &m->texts[m->ntexts];
+    t->key = dup_str(key);
+    t->lang = dup_str(lang);
+    t->value = dup_str(value);
+    if (!t->key || !t->value) {
+        free(t->key);
+        free(t->lang);
+        free(t->value);
+        return -1;
+    }
+    m->ntexts++;
+    return 0;
+}
+
+int img_meta_empty(const img_meta_t *m)
+{
+    return !m || (!m->exif && !m->xmp && !m->icc && m->ntexts == 0 &&
+                  m->xres <= 0 && m->yres <= 0);
 }
 
 void img_free_anim(img_animation_t *anim)
@@ -44,6 +133,7 @@ void img_free_anim(img_animation_t *anim)
     free(anim->y);
     free(anim->delays_cs);
     free(anim->dispose);
+    img_meta_free(&anim->meta);
     memset(anim, 0, sizeof(*anim));
 }
 

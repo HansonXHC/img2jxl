@@ -65,11 +65,11 @@ void DropPathEdit::dropEvent(QDropEvent *event)
 /* ---------------- ConvertTask ---------------- */
 
 ConvertTask::ConvertTask(MainWindow *win, QString in, QString out,
-                         int effort, bool modular, bool autoOpt, bool keepTime,
-                         bool replaceOriginal)
+                         int effort, bool modular, bool autoOpt, bool keepMeta,
+                         bool keepTime, bool replaceOriginal)
     : win_(win), in_(std::move(in)), out_(std::move(out)),
-      effort_(effort), modular_(modular), autoOpt_(autoOpt), keepTime_(keepTime),
-      replace_(replaceOriginal)
+      effort_(effort), modular_(modular), autoOpt_(autoOpt), keepMeta_(keepMeta),
+      keepTime_(keepTime), replace_(replaceOriginal)
 {
 }
 
@@ -79,6 +79,7 @@ void ConvertTask::run()
     opts.effort = effort_;
     opts.modular = modular_ ? 1 : 0;
     opts.auto_optimize = autoOpt_ ? 1 : 0;
+    opts.keep_metadata = keepMeta_ ? 1 : 0;
 
     img2jxl_result_t r;
     img2jxl_convert(in_.toLocal8Bit().constData(), out_.toLocal8Bit().constData(),
@@ -187,10 +188,13 @@ MainWindow::MainWindow(QWidget *parent)
     auto *opts2 = new QHBoxLayout;
     strictDepthBox_ = new QCheckBox;
     strictDepthBox_->setChecked(true);
+    keepMetaBox_ = new QCheckBox;
+    keepMetaBox_->setChecked(true);
     keepTimeBox_ = new QCheckBox;
     keepTimeBox_->setChecked(true);
     overwriteBox_ = new QCheckBox;
     opts2->addWidget(strictDepthBox_);
+    opts2->addWidget(keepMetaBox_);
     opts2->addWidget(keepTimeBox_);
     opts2->addWidget(overwriteBox_);
     opts2->addStretch();
@@ -248,6 +252,8 @@ void MainWindow::applyTexts()
     labelThreads_->setText(tr2("线程数:", "Threads:"));
     strictDepthBox_->setText(tr2("严格匹配源图位深（不勾选则自动优化：去无用alpha/灰度检测）",
                                  "Match source bit depth strictly (uncheck to auto-optimize: drop useless alpha / gray detection)"));
+    keepMetaBox_->setText(tr2("保留元数据（EXIF/ICC/DPI/文本）",
+                              "Keep metadata (EXIF/ICC/DPI/text)"));
     keepTimeBox_->setText(tr2("输出文件时间戳与输入一致", "Keep input timestamps on output"));
     overwriteBox_->setText(tr2("覆盖原文件（输出与输入相同时原地覆盖；同目录的非JXL转换成功后删除原文件）",
                                "Overwrite originals (in-place when output==input; same-folder non-JXL sources are deleted after conversion)"));
@@ -387,6 +393,7 @@ void MainWindow::runConversion()
     o.effort = levelSlider_->value();
     o.modular = modularBox_->isChecked() ? 1 : 0;
     o.auto_optimize = strictDepthBox_->isChecked() ? 0 : 1;
+    o.keep_metadata = keepMetaBox_->isChecked() ? 1 : 0;
 
     QThreadPool *pool = QThreadPool::globalInstance();
     pool->setMaxThreadCount(threadsBox_->value());
@@ -420,7 +427,8 @@ void MainWindow::runConversion()
         }
 
         auto *task = new ConvertTask(this, in, out, o.effort, o.modular != 0,
-                                     o.auto_optimize != 0, keepTimeBox_->isChecked(),
+                                     o.auto_optimize != 0, o.keep_metadata != 0,
+                                     keepTimeBox_->isChecked(),
                                      overwriteBox_->isChecked());
         pool->start(task);
     }

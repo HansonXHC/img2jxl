@@ -23,6 +23,31 @@ static void jpg_emit_message(j_common_ptr cinfo, int msg_level)
     (void)msg_level;    /* warnings and trace messages are ignored */
 }
 
+/* Pick up the Exif / XMP / ICC segments of a JPEG.  Only used on the pixel
+ * fallback path: the normal JPEG route transcodes the bitstream with libjxl,
+ * which carries the metadata itself. */
+static void jpeg_read_metadata(struct jpeg_decompress_struct *cinfo, img_meta_t *meta)
+{
+    for (jpeg_saved_marker_ptr m = cinfo->marker_list; m; m = m->next) {
+        if (m->marker != JPEG_APP0 + 1 && m->marker != JPEG_APP0 + 2)
+            continue;
+        const uint8_t *d = m->data;
+        size_t n = m->data_length;
+        if (m->marker == JPEG_APP0 + 1 && n > 6 && !memcmp(d, "Exif\0\0", 6)) {
+            img_meta_set_exif(meta, d + 6, n - 6);
+        } else if (m->marker == JPEG_APP0 + 1 && n > 29 &&
+                   !memcmp(d, "http://ns.adobe.com/xap/1.0/", 28)) {
+            img_meta_set_xmp(meta, d + 29, n - 29);
+        } else if (m->marker == JPEG_APP0 + 2 && n > 14 &&
+                   !memcmp(d, "ICC_PROFILE\0", 12)) {
+            /* ICC profiles are split across APP2 segments (byte 12 = sequence
+             * number, byte 13 = segment count); only carry a single-segment one */
+            if (d[13] == 1)
+                img_meta_set_icc(meta, d + 14, n - 14);
+        }
+    }
+}
+
 int jpeg_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
 {
     struct jpeg_decompress_struct cinfo;
@@ -40,6 +65,8 @@ int jpeg_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
     }
 
     jpeg_create_decompress(&cinfo);
+    jpeg_save_markers(&cinfo, JPEG_APP0 + 1, 0xFFFF);   /* Exif / XMP */
+    jpeg_save_markers(&cinfo, JPEG_APP0 + 2, 0xFFFF);   /* ICC */
     jpeg_stdio_src(&cinfo, f);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
@@ -53,9 +80,14 @@ int jpeg_decode(FILE *f, img_image_t *img, char *err, size_t errlen)
     int gray = (cinfo.jpeg_color_space == JCS_GRAYSCALE);
     cinfo.out_color_space = gray ? JCS_GRAYSCALE : JCS_RGB;
 
+    img_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    jpeg_read_metadata(&cinfo, &meta);
+
     jpeg_start_decompress(&cinfo);
 
     memset(img, 0, sizeof(*img));
+    img->meta = meta;
     img->width = (int)cinfo.output_width;
     img->height = (int)cinfo.output_height;
     img->color = gray ? IMG_GRAY : IMG_RGB;

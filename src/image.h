@@ -19,6 +19,33 @@ typedef enum {
     IMG_RGBA         /* 8/16-bit, 4 channels                 */
 } img_color_t;
 
+/* Ancillary metadata carried from the source container into the .jxl output.
+ * Every field is optional: the encoder writes only what is present, so a
+ * format without metadata simply yields a bare .jxl as before. */
+typedef struct {
+    char *key;              /* text pair, e.g. a PNG tEXt keyword */
+    char *lang;             /* iTXt language tag, may be NULL */
+    char *value;
+} img_text_t;
+
+typedef struct {
+    uint8_t *exif;  size_t exif_len;    /* Exif blob, WITHOUT the "Exif\0\0" prefix */
+    uint8_t *xmp;   size_t xmp_len;     /* XMP packet, UTF-8 */
+    uint8_t *icc;   size_t icc_len;     /* ICC profile */
+    double   xres, yres;                /* pixels per resolution unit */
+    int      res_unit;                  /* 1 = none, 2 = inch, 3 = cm; 0 = unknown */
+    img_text_t *texts;  int ntexts;     /* text chunks / comments */
+} img_meta_t;
+
+void img_meta_free(img_meta_t *m);
+int  img_meta_set_exif(img_meta_t *m, const uint8_t *d, size_t n);
+int  img_meta_set_xmp(img_meta_t *m, const uint8_t *d, size_t n);
+int  img_meta_set_icc(img_meta_t *m, const uint8_t *d, size_t n);
+int  img_meta_add_text(img_meta_t *m, const char *key, const char *lang,
+                       const char *value);
+/* True when there is nothing to write. */
+int  img_meta_empty(const img_meta_t *m);
+
 typedef struct {
     int width;
     int height;
@@ -45,6 +72,8 @@ typedef struct {
     /* GRAY only: optional single transparent-gray value (tRNS) */
     int      has_gray_trns;
     uint16_t gray_trns_value;   /* sample value at source depth */
+
+    img_meta_t meta;            /* ancillary metadata; zeroed when none */
 } img_image_t;
 
 /* Bytes per output row for the given geometry. */
@@ -71,6 +100,7 @@ typedef struct {
     int *delays_cs;
     int *dispose;
     int loops;
+    img_meta_t meta;        /* canvas-level metadata (GIF comments etc.) */
 } img_animation_t;
 
 void   img_free_anim(img_animation_t *anim);

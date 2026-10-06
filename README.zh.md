@@ -14,12 +14,14 @@ skcms），以及 libpng、libjpeg-turbo、giflib、libwebp、libtiff。所有�
 - **真无损，且经过校验**：JPEG XL 距离恒为 0。自测试会把每个输出解码回来，
   与源图逐像素比对。
 - **JPEG 零代损**：JPEG 输入在 DCT 系数层面转码（`JxlEncoderAddJPEGFrame`），
-  内嵌还原数据，原文件可逐字节还原。
+  内嵌还原数据，原文件可逐字节还原。拍摄信息（Exif / XMP / JUMBF）写入**未压缩**的
+  `Exif` / `xml ` / `jumb` 盒，普通看图软件可直接读取。
 - **GIF 动画 → JXL 动画**：帧延时、循环次数、帧偏移、透明与 disposal 语义全部保留。
 - **位深匹配**：颜色模型、位深与透明度跟随源图——16 位仍是 16 位，调色板仍是
   调色板，声明 10/12 位的 JXL 保留该深度。
 - **编码工具自动选择**：默认开启 Modular 模式，libjxl 会按图像内容自动挑选
   预测器、调色板变换、RCT 与 squeeze 等变换。除了努力程度，无需调节任何参数。
+- **保留元数据**：ICC、Exif、XMP、文本块与物理分辨率（DPI）都会随源文件带过来——转换后的照片仍保留拍摄信息，PNG 转换后仍保留 DPI。加 `--no-metadata` 可剥离。
 - **适合批处理**：文件夹递归扫描，多文件并行转换吃满所有核心，输出时间戳与输入一致。
 
 ## 支持的格式
@@ -38,7 +40,7 @@ skcms），以及 libpng、libjpeg-turbo、giflib、libwebp、libtiff。所有�
 | PNM P1/P2/P4/P5 | GRAY；PBM 保持 1 位；maxval > 255 → 16 位 |
 | PNM P3/P6 | RGB；maxval > 255 → 16 位 |
 | ICO | 取最大条目，保留其颜色类型与位深；应用 AND 掩码透明 |
-| JPEG | **位流转码**（内嵌还原数据，EXIF 保留）；失败时回退像素级重编码 |
+| JPEG | **位流转码**（内嵌还原数据，EXIF 以未压缩的 `Exif` 盒保存、可被普通软件读取）；失败时回退像素级重编码 |
 | PNG | 原生重编码：1/2/4/8/16 位、调色板、tRNS 全部保留 |
 | GIF | 多帧 → **JXL 动画**；单帧 → 8 位 RGB(A) + tRNS |
 | QOI | 8 位 RGB / RGBA |
@@ -63,6 +65,30 @@ TIFF 支持 chunky（交错）无符号整数样本。平面（planar）布局�
 - 恢复前帧（disposal-to-previous）为近似实现：把被释放区域清除为透明。帧区域以
   预合成方式存储，因此每个显示帧的可见内容完全精确；仅当"恢复前帧"揭示的像素
   落在后续帧矩形**之外**时，才可能与原生实现该模式的播放器有差异。
+
+### 元数据
+
+默认会携带源文件的元数据，让 `.jxl` 保留原文件的信息：
+
+- **ICC 配置文件** —— 成为码流的颜色编码（逐字节往返），而不是简单地标记为 sRGB。
+- **Exif** —— 写成**未压缩**的 `Exif` 盒。（JPEG 输入走 libjxl 的位流转码，由它自己写出该盒。）
+- **XMP** —— 写成 `xml ` 盒。
+- **文本** —— PNG 的 `tEXt`/`iTXt`/`zTXt`、TIFF 的描述/软件/作者/版权/日期、GIF 注释，统一写入私有 `jxtx` 盒；JPEG XL 没有标准的文本块承载方式，img2jxl 在再编码时会把它读回来。
+- **物理分辨率（DPI）** —— PNG 的 `pHYs`、TIFF 分辨率、JFIF 密度会存进 Exif 分辨率标签（`XResolution` / `YResolution` / `ResolutionUnit`），这也是看图软件读取 DPI 与打印尺寸的依据。
+
+命令行加 `--no-metadata`，或取消勾选 GUI 的「保留元数据」，则输出不含元数据的 `.jxl`。
+
+各输入格式能贡献的内容：
+
+| 源格式 | 写入 .jxl 的内容 |
+|---|---|
+| JPEG | Exif、XMP、JUMBF，由位流转码写出（该模式下无法剥离——libjxl 需要它们才能逐字节还原原 JPEG） |
+| PNG | `eXIf`、`iCCP`、`pHYs`、`tEXt`/`iTXt`/`zTXt` |
+| TIFF | 分辨率、ICC、XMP、描述/软件/作者/版权/日期 |
+| WebP | `EXIF`、`ICCP`、`XMP ` 块 |
+| GIF | 注释扩展 |
+| JXL | 盒与 ICC 会被读回并重新写出，因此 `.jxl` 再编码不丢元数据 |
+| BMP、TGA、PNM、QOI | 无元数据可带（ICO 继承其内嵌 PNG 的内容） |
 
 ## 构建
 
@@ -112,7 +138,7 @@ MinGW 构建会自动做两处调整，改动构建时值得留意：
 
 ```
 img2jxl [-o out.jxl|outdir] [-e 1-10] [--no-modular] [-j N] [--auto]
-        [--no-keep-time] 文件或文件夹...
+        [--no-metadata] [--no-keep-time] 文件或文件夹...
 ```
 
 | 选项 | 含义 | 默认 |
@@ -122,6 +148,7 @@ img2jxl [-o out.jxl|outdir] [-e 1-10] [--no-modular] [-j N] [--auto]
 | `--no-modular` | 由编码器逐帧选择 VarDCT/Modular | 强制 Modular |
 | `-j N` | 并行工作线程数 | 逻辑 CPU 核数 |
 | `--auto` | 优化模式（去无用 alpha、灰度检测） | 关 |
+| `--no-metadata` | 不把源文件的 EXIF/ICC/DPI/文本写入 .jxl | 默认保留元数据 |
 | `--no-keep-time` | 不从输入复制时间戳 | 保持时间戳 |
 
 需要注意的行为：
@@ -146,6 +173,7 @@ img2jxl -e 7 --no-modular a.ppm       # 更快编码，模式交给编码器
 - 把文件或文件夹拖到窗口，或用 **添加文件…** / **添加文件夹…**（文件夹递归扫描，
   自动去重）。
 - 努力程度滑条 1–10（默认 10）、**Modular 模式**复选框（默认开）、线程数。
+- **保留元数据**（默认开）携带 ICC/EXIF/DPI/文本；取消勾选则输出不含元数据。
 - **严格匹配源图位深**（默认开）——取消勾选即启用 `--auto` 优化。**时间戳与输入一致**
   默认开。
 - **覆盖原文件**（默认关）。不勾选时，输出会落在自身输入上的任务会被跳过并提示。
@@ -174,7 +202,9 @@ img2jxl -e 7 --no-modular a.ppm       # 更快编码，模式交给编码器
 - **调色板源**在编码前展开。Modular 的自动调色板变换通常能找回压缩率，因此输出
   一般不会比调色板索引的原图更大。
 - **JPEG 源**保留其 DCT 系数；libjxl 会存入重建原文件所需的信息，所以
-  `img2jxl photo.jpg` 是重新压缩，而不是重新编码。
+  `img2jxl photo.jpg` 是重新压缩，而不是重新编码。Exif/XMP/JUMBF 盒刻意保持未压缩：
+  libjxl 默认会把它 brotli 压进 `brob` 盒，而多数看图软件不解压这种盒，导致拍摄信息
+  看起来丢失。
 - **没有 GPU 路径**——批量并行转换已能吃满 CPU，而 GPU 熵编码器对单文件并不划算。
 
 ## 已知限制
@@ -186,6 +216,12 @@ img2jxl -e 7 --no-modular a.ppm       # 更快编码，模式交给编码器
 - 子字节源（1/2/4 位灰度或调色板）输出时展开为 8 位。样本值精确保留，但声明
   深度变为 8。
 - TIFF 的关联（预乘）alpha 原样保留，未做反预乘。
+- JPEG 位流转码路径上的元数据盒无法剥离（`--no-metadata` 也会保留）：libjxl 要求
+  Exif 与 XMP 必须在，才能逐字节还原原 JPEG。
+- TIFF 的 Exif IFD 不会被序列化进 Exif 盒；分辨率、ICC、XMP 与描述性标签会带过去。
+- 再编码 `.jxl` 时，其他工具写入的 brotli 压缩盒（`brob`）内的元数据会被跳过
+  （img2jxl 自己始终写未压缩盒）。
+- 文本写入私有 `jxtx` 盒，标准看图软件不显示——数据为再编码而保留，不作展示。
 - Windows 路径经 ANSI 代码页处理；Linux 与 macOS 使用 UTF-8。
 - Windows x64 已本地实测。`.github/workflows/build.yml` 中的 Linux 与 macOS 任务
   在 CI 中能构建并通过自测试，但尚未在真机验证。
